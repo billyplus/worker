@@ -1,11 +1,15 @@
 package worker
 
-import "sync/atomic"
+import (
+	"sync/atomic"
+	"time"
+)
 
 type jobPool struct {
 	jobQueue           chan Job
 	workerPool         chan jobChan
-	stop               chan struct{}
+	stopCh             chan struct{}
+	stopFlag           atomic.Int32
 	workerCount        atomic.Int32
 	workerInQueueCount atomic.Int32
 	jobInQueueCount    atomic.Int32
@@ -39,6 +43,10 @@ func NewJobPool(minWorkers, maxWorkers int, jobQueueLen int, opt ...Option) *job
 }
 
 func (p *jobPool) Run(fn func()) {
+	if p.stopFlag.Load() == 1 {
+		fn()
+		return
+	}
 	p.jobInQueueCount.Add(1)
 	p.jobQueue <- fn
 
@@ -48,9 +56,12 @@ func (p *jobPool) Run(fn func()) {
 func (p *jobPool) tryAddNewWorker() {
 	var worker jobChan
 	workerCount := p.workerCount.Load()
+	if workerCount >= p.maxWorkerCount {
+		return
+	}
 	if workerCount < p.minWorkerCount {
 		worker = make(jobChan)
-	} else if workerCount < p.maxWorkerCount {
+	} else {
 		jobInQueue := p.jobInQueueCount.Load()
 		workerInQueue := p.workerInQueueCount.Load()
 		if jobInQueue >= workerInQueue && (jobInQueue-workerInQueue)%3 == 2 {
@@ -63,10 +74,26 @@ func (p *jobPool) tryAddNewWorker() {
 	}
 }
 
+func (p *jobPool) tryExitWorker() bool {
+	workerCount := p.workerCount.Load()
+	if workerCount <= p.minWorkerCount {
+		return false
+	}
+	if workerCount > p.maxWorkerCount {
+		return true
+	}
+	jobInQueue := p.jobInQueueCount.Load()
+	if jobInQueue > 0 {
+		return false
+	}
+	workerInQueue := p.workerInQueueCount.Load()
+	return workerInQueue >= 16
+}
+
 // Will release resources used by pool
 func (p *jobPool) Stop() {
-	p.stop <- struct{}{}
-	<-p.stop
+	p.stopCh <- struct{}{}
+	<-p.stopCh
 }
 
 func (p *jobPool) dispatch() {
@@ -79,28 +106,40 @@ DispatchLoop:
 			worker = <-p.workerPool
 			p.workerInQueueCount.Add(-1)
 			worker <- job
-		case <-p.stop:
+		case <-p.stopCh:
 			break DispatchLoop
 		}
 	}
+	p.stopFlag.Store(1)
 	// 清空任务队列
 	for i := 0; i < 1000; i++ {
 		select {
 		case job := <-p.jobQueue:
+			p.jobInQueueCount.Add(-1)
 			worker := <-p.workerPool
+			p.workerInQueueCount.Add(-1)
 			worker <- job
 		default:
+		}
+	}
+
+	for p.workerCount.Load() > 0 {
+		timeout := time.After(1 * time.Second)
+		select {
+		case worker := <-p.workerPool:
+			p.workerInQueueCount.Add(-1)
+			close(worker)
+		case <-timeout:
+			continue
 		}
 	}
 
 	// 退出worker
 	count := p.workerCount.Load()
 	for i := int32(0); i < count; i++ {
-		worker := <-p.workerPool
-		close(worker)
 	}
 
-	p.stop <- struct{}{}
+	p.stopCh <- struct{}{}
 }
 
 func (p *jobPool) runWorker(worker jobChan) {
@@ -127,5 +166,9 @@ func (p *jobPool) runWorker(worker jobChan) {
 		}
 		p.jobInQueueCount.Add(-1)
 		job()
+
+		if p.tryExitWorker() {
+			return
+		}
 	}
 }
